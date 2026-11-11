@@ -1,6 +1,6 @@
 # Decisões da dupla
 
-**Integrantes:**
+**Integrantes: João Meneses e Wesley Sales**
 
 Responda cada item em no máximo 6 linhas e cite onde a decisão está no código (`Classe.metodo`).
 A resposta precisa descrever o que o **seu** código faz. Resposta genérica ou que o código não confirma vale zero.
