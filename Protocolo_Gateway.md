@@ -1,0 +1,5 @@
+ - TCP, porta 5000, uma linha por mensagem, UTF-8
+ - Solicitar <id> <nome> <oLat> <dLat> <dLon> <VIP | STANDARD> responde OK <corridaId>
+ - Cancelar <corridaId> responde CANCELADA <corridaId> ou NEGADO <corridaId>
+ - Qualquer linha malformatada responde ERRO <motivo>, e a conexão continua aberta 
+ - Eventos enviados pelo gateway sem pedido do passaegiro: ATRIBUIDA <corridaId> <motoristaId>, INICIADA <corridaId>, CONCLUIDA <corridaId> e EXPIRADA <corridaId>.
