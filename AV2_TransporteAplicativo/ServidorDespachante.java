@@ -35,32 +35,286 @@ public class ServidorDespachante extends UnicastRemoteObject implements ServicoD
         super();
     }
 
-    // =====================================================================
-    // A IMPLEMENTAR
-    // =====================================================================
+
+    /** Dados de uma corrida enquanto ela procura motorista (PENDENTE ou OFERTADA). */
+    private static final class Busca {
+        final RequisicaoCorrida corrida;
+        final long sequencia;                              // ordem de chegada, desempata timestamps iguais
+        final Set<String> descartados = new HashSet<>();   // motoristas que deixaram a oferta expirar (R5)
+        ScheduledFuture<?> prazoCorrida;                   // R6
+        ScheduledFuture<?> prazoOferta;                    // R5
+
+        Busca(RequisicaoCorrida corrida, long sequencia) {
+            this.corrida = corrida;
+            this.sequencia = sequencia;
+        }
+    }
+
+    /** Chamada remota a um motorista. */
+    private interface Aviso {
+        void enviar(CallbackMotorista callback) throws RemoteException;
+    }
+
+    /** R4: VIP antes de STANDARD; na mesma prioridade, a mais antiga primeiro. */
+    private static final Comparator<Busca> ORDEM_R4 = Comparator
+            .comparingInt((Busca b) -> b.corrida.getPrioridade() == Prioridade.VIP ? 0 : 1)
+            .thenComparingLong(b -> b.corrida.getTimestamp())
+            .thenComparingLong(b -> b.sequencia);
+
+    // Estado auxiliar: como os mapas acima, só é acessado com 'trava' adquirida.
+    private final Map<String, Busca> buscas = new HashMap<>();
+    private final TreeSet<Busca> espera = new TreeSet<>(ORDEM_R4);   // corridas PENDENTES, na ordem da R4
+    private final Map<String, CompletableFuture<Void>> avisosPorMotorista = new HashMap<>();
+    private long proximaSequencia;
 
     @Override
     public String solicitarCorrida(InfoPassageiro passageiro, Localizacao origem, Localizacao destino,
                                    Prioridade prioridade) throws RemoteException {
-        // TODO
-        throw new UnsupportedOperationException("solicitarCorrida");
+        if (passageiro == null || origem == null || destino == null || prioridade == null)
+            throw new RemoteException("Solicitação incompleta");
+        RequisicaoCorrida c;
+        trava.lock();
+        try {
+            String id;
+            do { id = novoId(); } while (corridas.containsKey(id));
+            c = new RequisicaoCorrida(id, passageiro, origem, destino, prioridade);
+            corridas.put(id, c);
+            Busca b = new Busca(c, proximaSequencia++);
+            buscas.put(id, b);
+            espera.add(b);
+            String corridaId = id;
+            b.prazoCorrida = agendar(() -> expirarCorrida(corridaId), TIMEOUT_MATCHING_MS);
+            casar();
+        } finally {
+            trava.unlock();
+        }
+        log("SOLICITADA " + c.getCorridaId() + " " + prioridade + " " + passageiro);
+        return c.getCorridaId();
     }
 
     @Override
     public boolean aceitarAtribuicao(String atribuicaoId) throws RemoteException {
-        // TODO
-        throw new UnsupportedOperationException("aceitarAtribuicao");
+        EventoCorrida evento;
+        trava.lock();
+        try {
+            Atribuicao a = atribuicoes.get(atribuicaoId);
+            if (a == null) return false;                       // oferta já retirada (ou nunca existiu)
+            RequisicaoCorrida c = corridas.get(a.getCorridaId());
+            Motorista m = motoristas.get(a.getMotoristaId());
+            if (c == null || m == null) return false;
+            if (c.getStatus() != StatusRequisicao.OFERTADA
+                    || !atribuicaoId.equals(c.getAtribuicaoId())
+                    || !atribuicaoId.equals(m.getAtribuicaoAtual())) return false;
+            // Prazos conferidos pelo relógio: não dependem de o temporizador já ter rodado.
+            long agora = System.currentTimeMillis();
+            if (agora - a.getTimestamp() >= TIMEOUT_CONFIRMACAO_MS
+                    || agora - c.getTimestamp() >= TIMEOUT_MATCHING_MS) return false;
+            encerrarBusca(c);
+            c.setStatus(StatusRequisicao.ATRIBUIDA);
+            evento = new EventoCorrida(c.getCorridaId(), StatusRequisicao.ATRIBUIDA, m.getId());
+        } finally {
+            trava.unlock();
+        }
+        publicar(evento);
+        return true;
     }
 
     @Override
     public boolean cancelarCorrida(String corridaId) throws RemoteException {
-        // TODO
-        throw new UnsupportedOperationException("cancelarCorrida");
+        EventoCorrida evento;
+        trava.lock();
+        try {
+            RequisicaoCorrida c = corridas.get(corridaId);
+            if (c == null) return false;
+            StatusRequisicao s = c.getStatus();
+            if (s != StatusRequisicao.PENDENTE && s != StatusRequisicao.OFERTADA
+                    && s != StatusRequisicao.ATRIBUIDA) return false;
+            encerrarBusca(c);
+            boolean liberouMotorista = retirarAtribuicao(c);
+            c.setStatus(StatusRequisicao.CANCELADA);
+            evento = new EventoCorrida(corridaId, StatusRequisicao.CANCELADA, null);
+            if (liberouMotorista) casar();
+        } finally {
+            trava.unlock();
+        }
+        publicar(evento);
+        return true;
     }
 
     /** Chamado pelo código pronto sempre que um motorista pode ter ficado livre. */
     private void motoristaFicouDisponivel(String motoristaId) {
-        // TODO
+        trava.lock();
+        try {
+            casar();   // só usa motoristas com isDisponivel(), então quem ainda tem corrida não recebe outra (R1)
+        } finally {
+            trava.unlock();
+        }
+    }
+
+    /** Temporizador da R5: a oferta não foi aceita em 2 s. */
+    private void expirarOferta(String atribuicaoId) {
+        String motoristaId;
+        String corridaId;
+        trava.lock();
+        try {
+            Atribuicao a = atribuicoes.get(atribuicaoId);
+            if (a == null) return;
+            RequisicaoCorrida c = corridas.get(a.getCorridaId());
+            Busca b = buscas.get(a.getCorridaId());
+            if (c == null || b == null || c.getStatus() != StatusRequisicao.OFERTADA
+                    || !atribuicaoId.equals(c.getAtribuicaoId())) return;
+            motoristaId = a.getMotoristaId();
+            corridaId = c.getCorridaId();
+            b.descartados.add(motoristaId);
+            b.prazoOferta = null;
+            retirarAtribuicao(c);
+            c.setStatus(StatusRequisicao.PENDENTE);
+            espera.add(b);   // volta com a antiguidade original
+            casar();
+        } finally {
+            trava.unlock();
+        }
+        log("OFERTA EXPIROU " + corridaId + " (" + motoristaId + ")");
+    }
+
+    /** Temporizador da R6: a corrida não foi aceita em 3 s. */
+    private void expirarCorrida(String corridaId) {
+        EventoCorrida evento;
+        trava.lock();
+        try {
+            RequisicaoCorrida c = corridas.get(corridaId);
+            if (c == null) return;
+            StatusRequisicao s = c.getStatus();
+            if (s != StatusRequisicao.PENDENTE && s != StatusRequisicao.OFERTADA) return;
+            encerrarBusca(c);
+            boolean liberouMotorista = retirarAtribuicao(c);
+            c.setStatus(StatusRequisicao.EXPIRADA);
+            evento = new EventoCorrida(corridaId, StatusRequisicao.EXPIRADA, null);
+            if (liberouMotorista) casar();
+        } finally {
+            trava.unlock();
+        }
+        publicar(evento);
+    }
+
+    /**
+     * Exige 'trava'. Oferece as corridas em espera, na ordem da R4, aos motoristas livres;
+     * cada corrida vai para o motorista livre mais próximo da origem que ainda não a deixou expirar.
+     */
+    private void casar() {
+        if (espera.isEmpty()) return;
+        List<Motorista> livres = new ArrayList<>();
+        for (Motorista m : motoristas.values()) if (m.isDisponivel()) livres.add(m);
+        Iterator<Busca> it = espera.iterator();
+        while (it.hasNext() && !livres.isEmpty()) {
+            Busca b = it.next();
+            Motorista escolhido = maisProximo(livres, b);
+            if (escolhido == null) continue;   // os livres já deixaram esta expirar: tenta a próxima da fila
+            it.remove();
+            livres.remove(escolhido);
+            ofertar(b, escolhido);
+        }
+    }
+
+    /** Exige 'trava'. */
+    private Motorista maisProximo(List<Motorista> livres, Busca b) {
+        Motorista melhor = null;
+        double menor = Double.MAX_VALUE;
+        for (Motorista m : livres) {
+            if (b.descartados.contains(m.getId())) continue;
+            double d = distancia(m.getInfo().getPosicao(), b.corrida.getOrigem());
+            if (melhor == null || d < menor || (d == menor && m.getId().compareTo(melhor.getId()) < 0)) {
+                melhor = m;
+                menor = d;
+            }
+        }
+        return melhor;
+    }
+
+    /** Exige 'trava'. Reserva o motorista para a corrida e agenda o envio da oferta e o prazo da R5. */
+    private void ofertar(Busca b, Motorista m) {
+        RequisicaoCorrida c = b.corrida;
+        String atribuicaoId;
+        do { atribuicaoId = novoId(); } while (atribuicoes.containsKey(atribuicaoId));
+        Atribuicao a = new Atribuicao(atribuicaoId, c.getCorridaId(), m.getId());
+        atribuicoes.put(atribuicaoId, a);
+        c.setStatus(StatusRequisicao.OFERTADA);
+        c.setAtribuicaoId(atribuicaoId);
+        c.setMotoristaId(m.getId());
+        m.setAtribuicaoAtual(atribuicaoId);
+        String id = atribuicaoId;
+        b.prazoOferta = agendar(() -> expirarOferta(id), TIMEOUT_CONFIRMACAO_MS);
+        AtribuicaoCorrida oferta = new AtribuicaoCorrida(atribuicaoId, c.getCorridaId(), c.getPassageiro(),
+                c.getOrigem(), c.getDestino(), c.getPrioridade());
+        avisarMotorista(m, "OFERTA " + c.getCorridaId(), cb -> cb.aoAtribuir(oferta));
+    }
+
+    /**
+     * Exige 'trava'. Desfaz a oferta/atribuição atual da corrida: o motorista fica livre e é avisado.
+     * Devolve true se havia um motorista preso a ela.
+     */
+    private boolean retirarAtribuicao(RequisicaoCorrida c) {
+        String atribuicaoId = c.getAtribuicaoId();
+        if (atribuicaoId == null) return false;
+        Atribuicao a = atribuicoes.remove(atribuicaoId);
+        c.setAtribuicaoId(null);
+        c.setMotoristaId(null);
+        Motorista m = (a == null) ? null : motoristas.get(a.getMotoristaId());
+        if (m == null) return false;
+        if (atribuicaoId.equals(m.getAtribuicaoAtual())) m.setAtribuicaoAtual(null);
+        avisarMotorista(m, "RETIRADA " + c.getCorridaId(), cb -> cb.aoCancelar(atribuicaoId));
+        return true;
+    }
+
+    /** Exige 'trava'. A corrida deixou de procurar motorista: sai da fila e perde os temporizadores. */
+    private void encerrarBusca(RequisicaoCorrida c) {
+        Busca b = buscas.remove(c.getCorridaId());
+        if (b == null) return;
+        espera.remove(b);
+        if (b.prazoCorrida != null) b.prazoCorrida.cancel(false);
+        if (b.prazoOferta != null) b.prazoOferta.cancel(false);
+    }
+
+    /**
+     * Exige 'trava', mas a chamada remota roda depois, numa thread do 'executor': motorista lento
+     * não segura a trava nem quem está atendendo outra corrida (R9). As chamadas a um mesmo
+     * motorista são encadeadas, para chegarem na ordem em que foram decididas.
+     */
+    private void avisarMotorista(Motorista m, String descricao, Aviso aviso) {
+        String motoristaId = m.getId();
+        CallbackMotorista callback = m.getCallback();
+        Runnable tarefa = () -> {
+            log(descricao + " -> " + motoristaId);
+            try {
+                aviso.enviar(callback);
+            } catch (Exception e) {
+                log("Motorista " + motoristaId + " não recebeu o aviso: " + e.getMessage());
+            }
+        };
+        CompletableFuture<Void> anterior =
+                avisosPorMotorista.getOrDefault(motoristaId, CompletableFuture.completedFuture(null));
+        avisosPorMotorista.put(motoristaId, anterior.thenRunAsync(tarefa, executor));
+    }
+
+    /** Fora da 'trava': registra e entrega o evento aos ouvintes, na thread de quem chamou. */
+    private void publicar(EventoCorrida evento) {
+        log(evento.getStatus() + " " + evento.getCorridaId()
+                + (evento.getMotoristaId() == null ? "" : " " + evento.getMotoristaId()));
+        try {
+            notificarOuvintes(evento);
+        } catch (RuntimeException e) {
+            log("Falha ao notificar " + evento + ": " + e);
+        }
+    }
+
+    private ScheduledFuture<?> agendar(Runnable tarefa, long atrasoMs) {
+        return agendador.schedule(() -> {
+            try {
+                tarefa.run();
+            } catch (RuntimeException e) {
+                log("Falha em temporizador: " + e);
+            }
+        }, atrasoMs, TimeUnit.MILLISECONDS);
     }
 
     // =====================================================================
